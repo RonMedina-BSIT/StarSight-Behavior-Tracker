@@ -1,0 +1,3 @@
+firebase-admin.json
+.venv/
+firestore_backup_*.json
