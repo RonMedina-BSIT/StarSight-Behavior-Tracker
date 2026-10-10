@@ -78,6 +78,16 @@ HOLD_SECONDS = {                 # how long a new state must persist before it i
 }
 DEFAULT_HOLD_S = 1.0
 
+# Cadence handling. The webcam demo runs at ~30 fps ("dense"), but the app sends one
+# snapshot every ~1-3 s ("sparse"). Time windows only make sense for dense input, so in
+# sparse mode the logic counts readings instead of seconds.
+SPARSE_GAP_S = 0.5               # average gap between readings above this = sparse
+MAX_SEGMENT_GAP_S = 30.0         # a longer pause (screen change, app paused) is not averaged in
+SPARSE_CLOSURE_READINGS = 3      # drooping = eyes closed in a majority of the last 3 readings
+SPARSE_CLOSURE_MIN = 2           # ...and at least 2 readings to judge
+SPARSE_CLOSURE_MAX_AGE_S = 12.0  # ignore stale readings
+DENSE_SMOOTHING = 5              # frames of median smoothing at video rate (1 in sparse mode)
+
 CALIBRATING_LABEL = "CALIBRATING - LOOK AT SCREEN"
 
 
@@ -170,6 +180,23 @@ class SessionState:
         self.shown_label = CALIBRATING_LABEL
         self._candidate = None
         self._candidate_since = 0.0
+        self.avg_gap = 1.0              # assume sparse (app snapshots) until measured
+        self.last_reading_t = None
+
+    @property
+    def sparse(self):
+        return self.avg_gap > SPARSE_GAP_S
+
+    def update_cadence(self, now):
+        """Track the average time between readings so the logic adapts to how
+        often frames actually arrive."""
+        if self.last_reading_t is not None:
+            gap = now - self.last_reading_t
+            if 0 < gap <= MAX_SEGMENT_GAP_S:
+                self.avg_gap = 0.7 * self.avg_gap + 0.3 * gap
+            elif gap > MAX_SEGMENT_GAP_S:
+                self.closure_log.clear()   # new segment: don't mix with old readings
+        self.last_reading_t = now
 
     def recalibrate(self):
         self.calibration.reset()
@@ -178,15 +205,23 @@ class SessionState:
         self.closure_log.clear()
         self.shown_label = CALIBRATING_LABEL
         self._candidate = None
+        self.last_reading_t = None
 
 
-def _median(buf):
-    return float(np.median(buf))
+def _median(buf, n=None):
+    items = list(buf)[-n:] if n else list(buf)
+    return float(np.median(items))
 
 
 def _debounce(state, raw_label, now):
     """A new label is only shown after it has persisted for its hold time.
     This removes single-frame flicker (blinks, brief glances, tracking glitches)."""
+    if state.sparse:
+        # Each app snapshot already stands for a few seconds, so don't delay it further.
+        state.shown_label = raw_label
+        state._candidate = None
+        return raw_label
+
     if raw_label == state.shown_label:
         state._candidate = None
         return state.shown_label
@@ -206,6 +241,9 @@ def _debounce(state, raw_label, now):
 # ==========================================
 def analyze_face(image, state: SessionState):
     now = time.monotonic()
+    state.update_cadence(now)
+    sparse = state.sparse
+    smooth_n = 1 if sparse else DENSE_SMOOTHING
     h, w = image.shape[:2]
 
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -244,11 +282,13 @@ def analyze_face(image, state: SessionState):
     state.mouth_buffer.append(mouth)
 
     # Median smoothing is more robust to landmark jitter than a plain average
-    s_gaze = _median(state.gaze_buffer) if state.gaze_buffer else gaze
-    s_ear = _median(state.ear_buffer)
-    s_yaw = _median(state.yaw_buffer)
-    s_pitch = _median(state.pitch_buffer)
-    s_mouth = _median(state.mouth_buffer)
+    # (In sparse mode each reading is seconds apart, so smoothing across readings would
+    # blur real changes: use the current reading only.)
+    s_gaze = _median(state.gaze_buffer, smooth_n) if state.gaze_buffer else gaze
+    s_ear = _median(state.ear_buffer, smooth_n)
+    s_yaw = _median(state.yaw_buffer, smooth_n)
+    s_pitch = _median(state.pitch_buffer, smooth_n)
+    s_mouth = _median(state.mouth_buffer, smooth_n)
 
     # --- 2. CALIBRATION GATE ---
     if not cal.done:
@@ -301,13 +341,27 @@ def analyze_face(image, state: SessionState):
         # C. Eye drooping: fraction of recent time the eyes were mostly closed.
         # A normal blink is short, so it barely moves this fraction.
         state.closure_log.append((now, ear_ratio < closed_threshold))
-        while state.closure_log and now - state.closure_log[0][0] > CLOSURE_WINDOW_S:
-            state.closure_log.popleft()
+        if sparse:
+            # Count readings, not seconds: e.g. closed in 2 of the last 3 snapshots.
+            while len(state.closure_log) > SPARSE_CLOSURE_READINGS:
+                state.closure_log.popleft()
+            while state.closure_log and now - state.closure_log[0][0] > SPARSE_CLOSURE_MAX_AGE_S:
+                state.closure_log.popleft()
+            min_samples = SPARSE_CLOSURE_MIN
+        else:
+            while state.closure_log and now - state.closure_log[0][0] > CLOSURE_WINDOW_S:
+                state.closure_log.popleft()
+            min_samples = CLOSURE_MIN_SAMPLES
 
         closed_fraction = sum(1 for _, c in state.closure_log if c) / len(state.closure_log)
         debug["closed_fraction"] = closed_fraction
 
-        if len(state.closure_log) >= CLOSURE_MIN_SAMPLES and closed_fraction > CLOSURE_FRACTION:
+        # In sparse mode also require the newest reading to be closed, so the label clears
+        # as soon as the eyes reopen instead of lingering for another snapshot.
+        latest_closed = state.closure_log[-1][1]
+        if (len(state.closure_log) >= min_samples
+                and closed_fraction > CLOSURE_FRACTION
+                and (latest_closed or not sparse)):
             raw_label = "UNFOCUSED - EYES DROOPING"
 
         # D. Gaze direction
