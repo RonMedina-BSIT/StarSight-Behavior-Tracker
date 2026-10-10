@@ -139,10 +139,16 @@ class Calibration:
         self.baseline_ear = 0.28
         self.baseline_width = 0.25
         self.baseline_mouth = 0.40
+        self.baseline_smile = 0.0   # legacy attribute, unused (kept in case server code reads it)
 
     @property
     def progress(self):
         return len(self._samples["gaze"])
+
+    @property
+    def gaze_samples(self):
+        """Legacy name: older server code may still read len(calibration.gaze_samples)."""
+        return self._samples["gaze"]
 
     def reset(self):
         for v in self._samples.values():
@@ -152,9 +158,11 @@ class Calibration:
     def add_sample(self, gaze, yaw, pitch, ear, width, mouth):
         if self.done:
             return
-        # Reject bad calibration frames: head clearly turned or eyes closed (blink)
-        if abs(yaw - 0.5) > 0.15 or ear < 0.15:
-            return
+        # Accept every frame that has a face. An earlier version rejected frames with a
+        # turned head or low eye openness, but a child looking DOWN at a tablet has
+        # partly-lowered eyelids and an off-centre nose, so every frame could be rejected
+        # and calibration never finished. The medians below already ignore blinks and
+        # stray frames.
         for key, val in zip(("gaze", "yaw", "pitch", "ear", "width", "mouth"),
                             (gaze, yaw, pitch, ear, width, mouth)):
             self._samples[key].append(val)
@@ -176,6 +184,7 @@ class SessionState:
         self.yaw_buffer = deque(maxlen=5)
         self.pitch_buffer = deque(maxlen=5)
         self.mouth_buffer = deque(maxlen=5)
+        self.smile_buffer = deque(maxlen=1)   # legacy, unused (older server code may .clear() it)
         self.closure_log = deque()          # (timestamp, eyes_closed_bool)
         self.shown_label = CALIBRATING_LABEL
         self._candidate = None
