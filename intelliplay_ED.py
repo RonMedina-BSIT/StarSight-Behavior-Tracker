@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import cv2
 import mediapipe as mp
@@ -52,7 +53,7 @@ LEFT_EYE_GAZE = (362, 263, 473)
 # ==========================================
 # TUNABLE THRESHOLDS (starting points - tune with your own test clips)
 # ==========================================
-CALIBRATION_FRAMES = 30
+CALIBRATION_FRAMES = 6         
 
 # Ratios relative to each person's own calibrated baseline
 FACE_WIDTH_MIN_RATIO = 0.60      # face narrower than 60% of baseline -> moved away
@@ -87,6 +88,13 @@ SPARSE_CLOSURE_READINGS = 3      # drooping = eyes closed in a majority of the l
 SPARSE_CLOSURE_MIN = 2           # ...and at least 2 readings to judge
 SPARSE_CLOSURE_MAX_AGE_S = 12.0  # ignore stale readings
 DENSE_SMOOTHING = 5              # frames of median smoothing at video rate (1 in sparse mode)
+
+# Adaptive baseline: refine the baseline while the child is clearly focused
+ADAPT_TAU_S = 30.0               # baseline "memory" in seconds (bigger = adapts slower)
+ADAPT_MAX_ALPHA = 0.15           # cap on the per-reading blend
+ADAPT_BAND = 0.7                 # only adapt when deviations are within 70% of the thresholds
+ADAPT_ABS_LIMIT = {"gaze": 0.06, "yaw": 0.08, "pitch": 0.05}      # max drift from the original
+ADAPT_REL_LIMIT = {"ear": 0.25, "width": 0.20, "mouth": 0.15}     # as a fraction of the original
 
 CALIBRATING_LABEL = "CALIBRATING - LOOK AT SCREEN"
 
@@ -129,10 +137,14 @@ def _head_ratios(pts):
 # CALIBRATION + SESSION STATE
 # ==========================================
 class Calibration:
+    WARMUP_FRAMES = 1   # first frame is ignored while the child settles in
+    _KEYS = ("gaze", "yaw", "pitch", "ear", "width", "mouth")
+
     def __init__(self, frames_needed=CALIBRATION_FRAMES):
         self.frames_needed = frames_needed
         self.done = False
-        self._samples = {k: [] for k in ("gaze", "yaw", "pitch", "ear", "width", "mouth")}
+        self._warmup_left = self.WARMUP_FRAMES
+        self._samples = {k: [] for k in self._KEYS}
         self.baseline_gaze = 0.5
         self.baseline_yaw = 0.5
         self.baseline_pitch = 0.5
@@ -140,6 +152,7 @@ class Calibration:
         self.baseline_width = 0.25
         self.baseline_mouth = 0.40
         self.baseline_smile = 0.0   # legacy attribute, unused (kept in case server code reads it)
+        self._initial = None        # baseline right after calibration (limits adaptive drift)
 
     @property
     def progress(self):
@@ -154,17 +167,17 @@ class Calibration:
         for v in self._samples.values():
             v.clear()
         self.done = False
+        self._warmup_left = self.WARMUP_FRAMES
+        self._initial = None
 
     def add_sample(self, gaze, yaw, pitch, ear, width, mouth):
         if self.done:
             return
-        # Accept every frame that has a face. An earlier version rejected frames with a
-        # turned head or low eye openness, but a child looking DOWN at a tablet has
-        # partly-lowered eyelids and an off-centre nose, so every frame could be rejected
-        # and calibration never finished. The medians below already ignore blinks and
-        # stray frames.
-        for key, val in zip(("gaze", "yaw", "pitch", "ear", "width", "mouth"),
-                            (gaze, yaw, pitch, ear, width, mouth)):
+        if self._warmup_left > 0:      # ignore the first frame(s)
+            self._warmup_left -= 1
+            return
+        # Accept every frame that has a face. 
+        for key, val in zip(self._KEYS, (gaze, yaw, pitch, ear, width, mouth)):
             self._samples[key].append(val)
         if self.progress >= self.frames_needed:
             self.baseline_gaze = float(np.median(self._samples["gaze"]))
@@ -174,6 +187,20 @@ class Calibration:
             self.baseline_width = float(np.median(self._samples["width"]))
             self.baseline_mouth = float(np.median(self._samples["mouth"]))
             self.done = True
+            self._initial = {k: getattr(self, f"baseline_{k}") for k in self._KEYS}
+
+    def adapt(self, alpha, **values):
+        """Nudge the baseline toward the current reading, but never far from the original."""
+        if not self.done or self._initial is None:
+            return
+        for key, val in values.items():
+            init = self._initial[key]
+            base = getattr(self, f"baseline_{key}")
+            new = base + alpha * (val - base)
+            limit = ADAPT_ABS_LIMIT.get(key)
+            if limit is None:
+                limit = abs(init) * ADAPT_REL_LIMIT[key]
+            setattr(self, f"baseline_{key}", min(max(new, init - limit), init + limit))
 
 
 class SessionState:
@@ -190,6 +217,7 @@ class SessionState:
         self._candidate = None
         self._candidate_since = 0.0
         self.avg_gap = 1.0              # assume sparse (app snapshots) until measured
+        self.last_gap = 0.0             # seconds since the previous reading (0 = no valid gap)
         self.last_reading_t = None
 
     @property
@@ -199,10 +227,12 @@ class SessionState:
     def update_cadence(self, now):
         """Track the average time between readings so the logic adapts to how
         often frames actually arrive."""
+        self.last_gap = 0.0
         if self.last_reading_t is not None:
             gap = now - self.last_reading_t
             if 0 < gap <= MAX_SEGMENT_GAP_S:
                 self.avg_gap = 0.7 * self.avg_gap + 0.3 * gap
+                self.last_gap = gap
             elif gap > MAX_SEGMENT_GAP_S:
                 self.closure_log.clear()   # new segment: don't mix with old readings
         self.last_reading_t = now
@@ -215,6 +245,7 @@ class SessionState:
         self.shown_label = CALIBRATING_LABEL
         self._candidate = None
         self.last_reading_t = None
+        self.last_gap = 0.0
 
 
 def _median(buf, n=None):
@@ -381,6 +412,23 @@ def analyze_face(image, state: SessionState):
         else:
             raw_label = "FOCUSED"
 
+    # --- 5. ADAPTIVE BASELINE (only while clearly focused) ---
+    # Slowly refines the quick calibration using readings where the child is clearly
+    # looking at the screen. Drift is capped relative to the original calibration.
+    debug["adapted"] = False
+    if (raw_label == "FOCUSED"
+            and state.last_gap > 0
+            and abs(gaze_deviation) < ADAPT_BAND * GAZE_AWAY_DEVIATION
+            and abs(yaw_deviation) < ADAPT_BAND * YAW_DEVIATION
+            and abs(pitch_deviation) < ADAPT_BAND * PITCH_DEVIATION
+            and 0.85 < width_ratio < 1.15
+            and ear_ratio >= 0.80
+            and not smiling_guard):
+        alpha = min(ADAPT_MAX_ALPHA, 1.0 - math.exp(-state.last_gap / ADAPT_TAU_S))
+        cal.adapt(alpha, gaze=s_gaze, yaw=s_yaw, pitch=s_pitch,
+                  ear=s_ear, width=face_width_norm, mouth=s_mouth)
+        debug["adapted"] = True
+
     label = _debounce(state, raw_label, now)
     debug["raw_label"] = raw_label
     return label, result.face_landmarks, debug
@@ -439,7 +487,8 @@ if __name__ == "__main__":
                 line2 = (f"ear {debug['ear_ratio']:.2f}  "
                          f"closed {debug.get('closed_fraction', 0):.2f}  "
                          f"width {debug['width_ratio']:.2f}  "
-                         f"mouth {debug['mouth_ratio']:.2f}")
+                         f"mouth {debug['mouth_ratio']:.2f}  "
+                         f"adapt {'Y' if debug.get('adapted') else 'n'}")
             _text(frame, line1, (20, 90), 0.55, (255, 255, 255), 1)
             _text(frame, line2, (20, 115), 0.55, (255, 255, 255), 1)
             if "raw_label" in debug:
